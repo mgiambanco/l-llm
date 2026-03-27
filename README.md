@@ -1,15 +1,19 @@
 # lang-llm
 
-An interactive CLI for language-specific code generation using local RAG (Retrieval-Augmented Generation). Search GitHub for reference repos, index them locally, then generate idiomatic code and write it directly to your project files.
+An interactive CLI for language-specific code generation using local RAG (Retrieval-Augmented Generation). Search GitHub for reference repos, index them locally, then generate idiomatic code — complete with comments, tests, and a dependency file — and write it directly to your project.
 
 No cloud APIs. Everything runs on your machine via [Ollama](https://ollama.com).
 
 ## How it works
 
 1. **Search** — Query GitHub for repos relevant to your use case and pick which ones to index
-2. **Index** — Repos are shallow-cloned, chunked into 80-line windows with 15-line overlap, embedded via Ollama, and stored in a local vector index at `~/.lang-llm/`
-3. **Generate** — Your prompt is embedded, the top-k most similar chunks are retrieved as context, and code is streamed from your local LLM
-4. **Save** — Generated code is written to a file in your working directory
+2. **Index** — Repos are shallow-cloned into `.l-llm/` in your project folder, chunked into 80-line windows with 15-line overlap, embedded via Ollama, and stored in a local vector index at `~/.lang-llm/`
+3. **Generate** — Your prompt is embedded, the top-k most similar chunks are retrieved as context, and commented code is streamed from your local LLM
+4. **Check** — The file is linted and compiled automatically; errors are shown inline
+5. **Test** — A test file is generated and saved alongside the source
+6. **Save** — Code, tests, and optionally a dependency file are written to your working directory
+
+Session state (working directory and language) is remembered between runs.
 
 ## Prerequisites
 
@@ -45,17 +49,15 @@ node dist/cli.js
 lang-llm
 ```
 
-On startup the app asks for your language and working directory, then drops into a persistent prompt:
+On first run the app asks for your project folder and language, then drops into a persistent prompt. On subsequent runs it offers to resume the last session:
 
 ```
 lang-llm  local RAG code generation via Ollama
 
-Languages: typescript, javascript, python, rust, go, cpp, ...  (help languages)
-
-What language are you working in? typescript
-✓ Language: typescript
-Working directory? (Enter to skip): ./my-project
+Last session: my-project / typescript
+Resume? [Y/n]
 ✓ Directory: /home/user/my-project
+✓ Language: typescript
 
 Type "help" for commands, "exit" to quit.
 
@@ -66,7 +68,7 @@ Type "help" for commands, "exit" to quit.
 
 ### `search <query>`
 
-Search GitHub for repos matching your query and the current language. Pick results by number to index them.
+Search GitHub for repos matching your query and the current language. Pick results by number to index them. Clones are cached in `.l-llm/` inside your project folder.
 
 ```
 > [typescript] search http framework
@@ -81,10 +83,17 @@ Index repos (e.g. 1 3) or Enter to cancel: 1 2
 
 ### `gen "<prompt>"`
 
-Generate code using RAG context. If a working directory is set, prompts to save the output to a file.
+Generate code using RAG context. The output includes inline comments and a top-level doc comment. After saving, the app automatically:
+
+- Lints the file (using `tsc`, `ruff`, `go vet`, etc. — whichever is available)
+- Runs a build/syntax check (`python -m py_compile`, `cargo check`, `javac`, etc.)
+- Generates a test file and saves it next to the source
+- Offers to generate or update the project's dependency file
+
+The save prompt suggests a filename derived from your prompt:
 
 ```
-> [typescript] gen "JWT authentication middleware"
+Save to file? [jwt-auth-middleware.ts] (path, Enter to accept, - to skip):
 ```
 
 Include a local file as extra context with `-f`:
@@ -140,7 +149,11 @@ Show all indexed repositories.
 
 ### `remove <repo-url>`
 
-Remove all indexed chunks for a given repo.
+Remove all indexed chunks for a given repo from the vector store.
+
+### `clear-cache`
+
+Delete all cached repo clones from `.l-llm/` in the current working directory. Prompts for confirmation before deleting.
 
 ### `config`
 
@@ -179,6 +192,69 @@ Show command reference or detailed help for a specific topic.
 > help models
 ```
 
+## Repo cache
+
+When a working directory is set, cloned repos are stored in `.l-llm/` inside that directory instead of a temporary folder. This means:
+
+- Re-indexing a repo reuses the existing clone (faster)
+- Clones persist between sessions
+- `clear-cache` removes them when no longer needed
+
+Add `.l-llm/` to your `.gitignore` to avoid committing cloned repos.
+
+## Session persistence
+
+The last working directory and language are saved to `~/.lang-llm/session.json`. On startup, the app offers to resume where you left off.
+
+## Lint and build checks
+
+After saving generated code, the app runs available tools automatically:
+
+| Language | Lint | Build check |
+|---|---|---|
+| TypeScript / JavaScript | `tsc --noEmit` (or `eslint` if config present) | `tsc --noEmit` |
+| Python | `ruff check` → `flake8` → `pylint` | `python -m py_compile` |
+| Rust | `cargo clippy` (if `Cargo.toml` present) | `cargo check` |
+| Go | `go vet` | `go build` |
+| Java | — | `javac` |
+| Swift | — | `swift -typecheck` |
+| Elixir | — | `elixirc` |
+| Haskell | — | `ghc -fno-code` |
+| Zig | — | `zig build-obj` |
+
+Tools that are not installed are skipped silently.
+
+## Test file generation
+
+A test file is always generated alongside the source using the language's conventional naming:
+
+| Language | Convention |
+|---|---|
+| TypeScript / JavaScript | `<name>.test.ts` / `<name>.test.js` |
+| Python | `test_<name>.py` |
+| Go | `<name>_test.go` |
+| Java / Kotlin / C# | `<Name>Test.java` / `<Name>Test.kt` / `<Name>Tests.cs` |
+| Ruby | `<name>_spec.rb` |
+| Elixir | `<name>_test.exs` |
+| Scala | `<Name>Spec.scala` |
+
+## Dependency file generation
+
+After saving, the app offers to generate or update the project's dependency file using the LLM:
+
+| Language | File |
+|---|---|
+| TypeScript / JavaScript | `package.json` |
+| Python | `requirements.txt` |
+| Rust | `Cargo.toml` |
+| Go | `go.mod` |
+| Java | `pom.xml` |
+| Ruby | `Gemfile` |
+| PHP | `composer.json` |
+| Swift | `Package.swift` |
+| Elixir | `mix.exs` |
+| Zig | `build.zig.zon` |
+
 ## Supported languages
 
 `typescript`, `javascript`, `python`, `rust`, `go`, `java`, `cpp`, `c`, `csharp`, `ruby`, `php`, `swift`, `kotlin`, `scala`, `haskell`, `elixir`, `lua`, `zig`
@@ -196,11 +272,12 @@ Show command reference or detailed help for a specific topic.
 src/
 ├── cli.ts        — Interactive REPL, command dispatch, startup prompts
 ├── github.ts     — GitHub repo search via REST API
-├── config.ts     — Config read/write (~/.lang-llm/config.json)
+├── config.ts     — Config + session persistence (~/.lang-llm/)
 ├── chunk.ts      — Line-based chunker + language→extension map
 ├── store.ts      — Vectra vector store wrapper
-├── ingest.ts     — Clone → filter → chunk → embed → store
-└── generate.ts   — Embed query → retrieve → stream generation → return output
+├── ingest.ts     — Clone → filter → chunk → embed → store (with .l-llm cache)
+├── generate.ts   — RAG code generation, test generation, dep file generation
+└── runner.ts     — Per-language lint and build check commands
 ```
 
 ## Stack

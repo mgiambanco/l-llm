@@ -1,5 +1,5 @@
 import { simpleGit } from 'simple-git'
-import { mkdtempSync, rmSync, readFileSync } from 'fs'
+import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import fg from 'fast-glob'
@@ -8,10 +8,18 @@ import { chunkFile, LANG_EXTENSIONS } from './chunk.js'
 import { addChunks, ensureIndex } from './store.js'
 import { getConfig } from './config.js'
 
+function repoSlug(repoUrl: string): string {
+  return repoUrl
+    .replace(/^https?:\/\//, '')
+    .replace(/\.git$/, '')
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+}
+
 export async function ingestRepo(
   repoUrl: string,
   language: string,
   onProgress?: (msg: string) => void,
+  cacheDir?: string,
 ): Promise<number> {
   const config = getConfig()
   const lang = language.toLowerCase()
@@ -24,15 +32,31 @@ export async function ingestRepo(
 
   await ensureIndex()
 
-  const tmpDir = mkdtempSync(join(tmpdir(), 'lang-llm-'))
+  // Determine clone destination
+  let repoDir: string
+  let isCached = false
+
+  if (cacheDir) {
+    mkdirSync(cacheDir, { recursive: true })
+    repoDir = join(cacheDir, repoSlug(repoUrl))
+    isCached = existsSync(repoDir)
+  } else {
+    repoDir = mkdtempSync(join(tmpdir(), 'lang-llm-'))
+  }
+
+  const cleanup = !cacheDir ? () => rmSync(repoDir, { recursive: true, force: true }) : () => {}
 
   try {
-    onProgress?.(`Cloning ${repoUrl} (shallow)...`)
-    await simpleGit().clone(repoUrl, tmpDir, ['--depth', '1'])
+    if (isCached) {
+      onProgress?.(`Using cached ${repoUrl}...`)
+    } else {
+      onProgress?.(`Cloning ${repoUrl} (shallow)...`)
+      await simpleGit().clone(repoUrl, repoDir, ['--depth', '1'])
+    }
 
     const patterns = extensions.map((ext) => `**/*${ext}`)
     const files = await fg(patterns, {
-      cwd: tmpDir,
+      cwd: repoDir,
       ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**', '**/vendor/**', '**/target/**'],
       absolute: true,
     })
@@ -44,8 +68,7 @@ export async function ingestRepo(
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
-      // Normalize path separators and strip temp dir prefix
-      const relativePath = file.replace(tmpDir, '').replace(/\\/g, '/').replace(/^\//, '')
+      const relativePath = file.replace(repoDir, '').replace(/\\/g, '/').replace(/^\//, '')
       onProgress?.(`[${i + 1}/${files.length}] ${relativePath}`)
 
       let content: string
@@ -76,6 +99,6 @@ export async function ingestRepo(
 
     return totalChunks
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true })
+    cleanup()
   }
 }

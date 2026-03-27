@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 import { createInterface, Interface } from 'readline/promises'
 import { resolve, join, relative, basename } from 'path'
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from 'fs'
 import chalk from 'chalk'
 import ora from 'ora'
 import fg from 'fast-glob'
 import { ingestRepo } from './ingest.js'
-import { generateCode } from './generate.js'
+import { generateCode, generateTests, generateDepsFile, DEP_FILES } from './generate.js'
+import { lintFile, buildCheck, testFilename } from './runner.js'
 import { getIndexedRepos, removeRepo } from './store.js'
-import { getConfig, saveConfig, ensureDirs } from './config.js'
+import { getConfig, saveConfig, ensureDirs, loadSession, saveSession } from './config.js'
 import { supportedLanguages, languageExtensions } from './chunk.js'
 import { searchGitHub } from './github.js'
 
@@ -67,7 +68,31 @@ function parseArgs(args: string[]): { positional: string[]; opts: Record<string,
 let defaultLanguage: string | null = null
 let workingDir: string | null = null
 
+function persistSession(): void {
+  saveSession({
+    workingDir: workingDir ?? undefined,
+    defaultLanguage: defaultLanguage ?? undefined,
+  })
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
+function suggestFilename(prompt: string, language: string): string {
+  const slug = prompt
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .split('-')
+    .slice(0, 5)
+    .join('-')
+  const extMap: Record<string, string> = {
+    typescript: '.ts', javascript: '.js', python: '.py', rust: '.rs',
+    go: '.go', java: '.java', cpp: '.cpp', c: '.c', csharp: '.cs',
+    ruby: '.rb', php: '.php', swift: '.swift', kotlin: '.kt',
+    scala: '.scala', haskell: '.hs', elixir: '.ex', lua: '.lua', zig: '.zig',
+  }
+  return slug + (extMap[language] ?? '.txt')
+}
+
 function formatStars(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 }
@@ -104,6 +129,7 @@ async function cmdOpen(args: string[]): Promise<void> {
   }
 
   workingDir = resolved
+  persistSession()
   console.log(chalk.green(`Working directory: ${workingDir}`))
 }
 
@@ -147,9 +173,10 @@ async function cmdAdd(args: string[]): Promise<void> {
     return
   }
 
+  const cacheDir = workingDir ? join(workingDir, '.l-llm') : undefined
   const spinner = ora('Preparing...').start()
   try {
-    const total = await ingestRepo(repoUrl, language, (msg) => { spinner.text = msg })
+    const total = await ingestRepo(repoUrl, language, (msg) => { spinner.text = msg }, cacheDir)
     spinner.succeed(chalk.green(`Done — ${total} chunks indexed from ${repoUrl}`))
   } catch (e: any) {
     spinner.fail(chalk.red(String(e.message ?? e)))
@@ -216,9 +243,10 @@ async function cmdSearch(args: string[]): Promise<void> {
 
   for (const idx of indices) {
     const repo = repos[idx]
+    const cacheDir2 = workingDir ? join(workingDir, '.l-llm') : undefined
     const spinner2 = ora(`Indexing ${repo.full_name}...`).start()
     try {
-      const total = await ingestRepo(repo.clone_url, language, (msg) => { spinner2.text = msg })
+      const total = await ingestRepo(repo.clone_url, language, (msg) => { spinner2.text = msg }, cacheDir2)
       spinner2.succeed(chalk.green(`Done — ${total} chunks indexed from ${repo.full_name}`))
     } catch (e: any) {
       spinner2.fail(chalk.red(String(e.message ?? e)))
@@ -270,14 +298,18 @@ async function cmdGenerate(args: string[]): Promise<void> {
   let savePath = outputFlag ? resolvePath(outputFlag) : undefined
 
   if (!savePath && workingDir) {
+    const suggestion = suggestFilename(prompt, language)
     let answer: string
     try {
-      answer = await iface.question(chalk.dim('Save to file? (relative path, or Enter to skip): '))
+      answer = await iface.question(
+        chalk.dim('Save to file? ') + chalk.dim(`[${suggestion}] `) + chalk.dim('(path, Enter to accept, - to skip): '),
+      )
     } catch {
       return
     }
-    if (answer.trim()) {
-      savePath = resolvePath(answer.trim())
+    const trimmed = answer.trim()
+    if (trimmed !== '-') {
+      savePath = resolvePath(trimmed || suggestion)
     }
   }
 
@@ -293,6 +325,78 @@ async function cmdGenerate(args: string[]): Promise<void> {
 
     const display = workingDir ? relative(workingDir, savePath) : savePath
     console.log(chalk.green(`✓ Written to ${display}`))
+
+    const checkCwd = workingDir ?? resolve(savePath, '..')
+
+    // Lint
+    const lintResult = lintFile(savePath, language, checkCwd)
+    if (lintResult) {
+      const label = lintResult.success ? chalk.green('✓ Lint passed') : chalk.red('✗ Lint errors')
+      console.log(`${label}  ${chalk.dim(`(${lintResult.tool})`)}`)
+      if (!lintResult.success && lintResult.output) {
+        console.log(chalk.dim(lintResult.output.split('\n').map(l => '  ' + l).join('\n')))
+      }
+    }
+
+    // Build / syntax check
+    const buildResult = buildCheck(savePath, language, checkCwd)
+    if (buildResult) {
+      const label = buildResult.success ? chalk.green('✓ Build passed') : chalk.red('✗ Build errors')
+      console.log(`${label}  ${chalk.dim(`(${buildResult.tool})`)}`)
+      if (!buildResult.success && buildResult.output) {
+        console.log(chalk.dim(buildResult.output.split('\n').map(l => '  ' + l).join('\n')))
+      }
+    }
+
+    // Generate test file
+    const testFile = testFilename(savePath, language)
+    const testPath = join(resolve(savePath, '..'), testFile)
+    console.log(chalk.dim(`\n--- ${testFile} ---\n`))
+    let testContent = ''
+    try {
+      testContent = await generateTests(cleaned, language, testFile)
+      console.log(chalk.dim('\n--- End ---\n'))
+      const testCleaned = testContent
+        .replace(/^```[^\n]*\n/, '')
+        .replace(/\n```\s*$/, '')
+        .trimEnd()
+      writeFileSync(testPath, testCleaned + '\n', 'utf-8')
+      const testDisplay = workingDir ? relative(workingDir, testPath) : testPath
+      console.log(chalk.green(`✓ Tests written to ${testDisplay}`))
+    } catch (e: any) {
+      console.log(chalk.red(`Tests failed: ${String(e.message ?? e)}`))
+    }
+
+    // Offer to generate a dependency file if the language has one
+    const depFileName = DEP_FILES[language]
+    if (depFileName && workingDir) {
+      const depPath = join(workingDir, depFileName)
+      const depExists = existsSync(depPath)
+      const depLabel = depExists ? chalk.yellow(`Update ${depFileName}?`) : chalk.bold(`Generate ${depFileName}?`)
+      let depAnswer: string
+      try {
+        depAnswer = await iface.question(depLabel + chalk.dim(' [y/N] '))
+      } catch {
+        return
+      }
+      if (depAnswer.trim().toLowerCase() === 'y') {
+        console.log(chalk.dim(`\n--- ${depFileName} ---\n`))
+        let depContent = ''
+        try {
+          depContent = await generateDepsFile(cleaned, language, depFileName)
+          console.log(chalk.dim('\n--- End ---\n'))
+        } catch (e: any) {
+          console.log(chalk.red(String(e.message ?? e)))
+          return
+        }
+        const depCleaned = depContent
+          .replace(/^```[^\n]*\n/, '')
+          .replace(/\n```\s*$/, '')
+          .trimEnd()
+        writeFileSync(depPath, depCleaned + '\n', 'utf-8')
+        console.log(chalk.green(`✓ Written to ${depFileName}`))
+      }
+    }
   }
 }
 
@@ -331,6 +435,47 @@ async function cmdRemove(args: string[]): Promise<void> {
   }
 }
 
+async function cmdClearCache(): Promise<void> {
+  if (!workingDir) {
+    console.log(chalk.red('No working directory set. Run: open <path>'))
+    return
+  }
+
+  const cacheDir = join(workingDir, '.l-llm')
+  if (!existsSync(cacheDir)) {
+    console.log(chalk.dim('Cache is already empty.'))
+    return
+  }
+
+  const entries = readdirSync(cacheDir)
+  if (entries.length === 0) {
+    console.log(chalk.dim('Cache is already empty.'))
+    return
+  }
+
+  let answer: string
+  try {
+    answer = await iface.question(
+      chalk.bold(`Delete ${entries.length} cached repo(s) in .l-llm? `) + chalk.dim('[y/N] '),
+    )
+  } catch {
+    return
+  }
+
+  if (answer.trim().toLowerCase() !== 'y') {
+    console.log(chalk.dim('Cancelled.'))
+    return
+  }
+
+  const spinner = ora('Clearing cache...').start()
+  try {
+    rmSync(cacheDir, { recursive: true, force: true })
+    spinner.succeed(chalk.green(`Cleared ${entries.length} cached repo(s) from .l-llm`))
+  } catch (e: any) {
+    spinner.fail(chalk.red(String(e.message ?? e)))
+  }
+}
+
 function cmdConfig(args: string[]): void {
   const { opts } = parseArgs(args)
   if (opts.model) saveConfig({ llmModel: opts.model })
@@ -354,6 +499,7 @@ function cmdSet(args: string[]): void {
   if (key === 'language' || key === 'lang') {
     if (!value) { console.log(chalk.red('Usage: set language <lang>')); return }
     defaultLanguage = value
+    persistSession()
     console.log(chalk.green(`Default language set to: ${defaultLanguage}`))
   } else if (!key) {
     console.log(chalk.red('Usage: set language <lang>'))
@@ -506,7 +652,8 @@ function cmdHelp(args: string[]): void {
   console.log(`  ${chalk.cyan('gen')} "<prompt>" ${chalk.dim('[-f <file>] [-o <out>]')}  Generate and save code`)
   console.log(`  ${chalk.cyan('add')} <repo-url>                    Index a specific repo`)
   console.log(`  ${chalk.cyan('list')}                              Show indexed repos`)
-  console.log(`  ${chalk.cyan('remove')} <repo-url>                 Remove a repo`)
+  console.log(`  ${chalk.cyan('remove')} <repo-url>                 Remove a repo from the index`)
+  console.log(`  ${chalk.cyan('clear-cache')}                       Delete all cached repos in .l-llm`)
   console.log(`  ${chalk.cyan('config')} ${chalk.dim('[--model] [--embed-model]')}     View/change models`)
   console.log(`  ${chalk.cyan('set')} language <lang>               Set session language`)
   console.log(`  ${chalk.cyan('help')} [topic]                      Show help`)
@@ -530,8 +677,9 @@ async function dispatch(args: string[]): Promise<boolean> {
     case 'gen':
     case 'generate': await cmdGenerate(rest); break
     case 'list':     await cmdList(); break
-    case 'remove':   await cmdRemove(rest); break
-    case 'config':   cmdConfig(rest); break
+    case 'remove':      await cmdRemove(rest); break
+    case 'clear-cache': await cmdClearCache(); break
+    case 'config':      cmdConfig(rest); break
     case 'set':      cmdSet(rest); break
     case 'help':     cmdHelp(rest); break
     case 'exit':
@@ -561,6 +709,7 @@ async function promptLanguage(): Promise<void> {
   const lang = answer.trim().toLowerCase()
   if (lang && langs.includes(lang)) {
     defaultLanguage = lang
+    persistSession()
     console.log(chalk.green(`✓ Language: ${defaultLanguage}`))
   } else if (lang) {
     console.log(chalk.yellow(`"${lang}" not recognised — you can still use: set language <lang>`))
@@ -585,6 +734,7 @@ async function promptWorkingDir(): Promise<void> {
   }
 
   workingDir = resolved
+  persistSession()
   console.log(chalk.green(`✓ Directory: ${workingDir}`))
 }
 
@@ -609,8 +759,39 @@ async function main(): Promise<void> {
     setTimeout(() => { sigintPending = false }, 2000)
   })
 
-  await promptLanguage()
-  await promptWorkingDir()
+  const saved = loadSession()
+  if (saved.workingDir || saved.defaultLanguage) {
+    const parts = [
+      saved.workingDir  ? chalk.cyan(basename(saved.workingDir)) : null,
+      saved.defaultLanguage ? chalk.cyan(saved.defaultLanguage) : null,
+    ].filter(Boolean).join(chalk.dim(' / '))
+    console.log(chalk.dim(`Last session: ${parts}`))
+    let resume: string
+    try {
+      resume = await iface.question(chalk.bold('Resume? ') + chalk.dim('[Y/n] '))
+    } catch {
+      resume = 'y'
+    }
+    if (resume.trim().toLowerCase() !== 'n') {
+      if (saved.workingDir && existsSync(saved.workingDir)) {
+        workingDir = saved.workingDir
+        console.log(chalk.green(`✓ Directory: ${workingDir}`))
+      } else if (saved.workingDir) {
+        console.log(chalk.yellow(`Saved directory not found: ${saved.workingDir}`))
+      }
+      if (saved.defaultLanguage) {
+        defaultLanguage = saved.defaultLanguage
+        console.log(chalk.green(`✓ Language: ${defaultLanguage}`))
+      }
+      console.log()
+    } else {
+      await promptWorkingDir()
+      await promptLanguage()
+    }
+  } else {
+    await promptWorkingDir()
+    await promptLanguage()
+  }
 
   console.log()
   console.log(chalk.dim('Type "help" for commands, "exit" to quit.'))

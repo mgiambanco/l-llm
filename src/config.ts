@@ -37,3 +37,24 @@ export function ensureDirs(): void {
   mkdirSync(CONFIG_DIR, { recursive: true })
   mkdirSync(config.dbPath, { recursive: true })
 }
+
+export interface Session {
+  workingDir?: string
+  defaultLanguage?: string
+}
+
+const SESSION_FILE = join(CONFIG_DIR, 'session.json')
+
+export function loadSession(): Session {
+  if (!existsSync(SESSION_FILE)) return {}
+  try {
+    return JSON.parse(readFileSync(SESSION_FILE, 'utf-8'))
+  } catch {
+    return {}
+  }
+}
+
+export function saveSession(session: Session): void {
+  mkdirSync(CONFIG_DIR, { recursive: true })
+  writeFileSync(SESSION_FILE, JSON.stringify(session, null, 2))
+}
