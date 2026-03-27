@@ -176,6 +176,7 @@ async function cmdSearch(args: string[]): Promise<void> {
   try {
     repos = await searchGitHub(query, language)
     spinner.stop()
+    process.stdin.resume()
   } catch (e: any) {
     spinner.fail(chalk.red(String(e.message ?? e)))
     return
@@ -597,9 +598,15 @@ async function main(): Promise<void> {
 
   iface = createInterface({ input: process.stdin, output: process.stdout })
 
+  let sigintPending = false
   iface.on('SIGINT', () => {
-    console.log('\nGoodbye!')
-    process.exit(0)
+    if (sigintPending) {
+      console.log('\nGoodbye!')
+      process.exit(0)
+    }
+    sigintPending = true
+    console.log(chalk.dim('\n(Press Ctrl+C again to exit)'))
+    setTimeout(() => { sigintPending = false }, 2000)
   })
 
   await promptLanguage()
@@ -610,6 +617,7 @@ async function main(): Promise<void> {
   console.log()
 
   while (true) {
+    process.stdin.resume()
     let line: string
     try {
       line = await iface.question(promptStr())
