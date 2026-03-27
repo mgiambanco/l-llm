@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(node dist/cli.js --help)",
+      "Bash(node dist/cli.js add --help)",
+      "Bash(node dist/cli.js generate --help)",
+      "Bash(node dist/cli.js config)",
+      "Bash(node dist/cli.js help)",
+      "Bash(node dist/cli.js help generate)",
+      "Bash(node dist/cli.js help languages)",
+      "Bash(node dist/cli.js help models)"
+    ]
+  }
+}
