@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 import { createInterface, Interface } from 'readline/promises'
 import { resolve, join, relative, basename } from 'path'
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync } from 'fs'
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, statSync, unlinkSync } from 'fs'
+import { spawnSync } from 'child_process'
 import chalk from 'chalk'
 import ora from 'ora'
 import fg from 'fast-glob'
-import { ingestRepo } from './ingest.js'
-import { generateCode, generateTests, generateDepsFile, DEP_FILES } from './generate.js'
-import { lintFile, buildCheck, testFilename } from './runner.js'
+import { ingestRepo, ingestDir } from './ingest.js'
+import { generateCode, generateTests, generateDepsFile, DEP_FILES, fixCode, refineCode, explainCode, refactorCode } from './generate.js'
+import { lintFile, buildCheck, testFilename, runTests, type CheckResult } from './runner.js'
 import { getIndexedRepos, removeRepo } from './store.js'
-import { getConfig, saveConfig, ensureDirs, loadSession, saveSession } from './config.js'
-import { supportedLanguages, languageExtensions } from './chunk.js'
+import { getConfig, saveConfig, ensureDirs, loadSession, saveSession, setProjectConfigDir, saveProjectConfig, CONFIG_DIR } from './config.js'
+import { supportedLanguages, languageExtensions, LANG_EXTENSIONS } from './chunk.js'
 import { searchGitHub } from './github.js'
 
 // Module-level readline interface so commands can ask follow-up questions
@@ -67,6 +68,10 @@ function parseArgs(args: string[]): { positional: string[]; opts: Record<string,
 // ── session state ──────────────────────────────────────────────────────────
 let defaultLanguage: string | null = null
 let workingDir: string | null = null
+let lastCode: string | null = null
+let lastSavePath: string | null = null
+let lastLanguage: string | null = null
+let undoStack: Array<{ path: string; content: string | null }> = []
 
 function persistSession(): void {
   saveSession({
@@ -76,6 +81,23 @@ function persistSession(): void {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+function writeWithUndo(filePath: string, content: string): void {
+  if (existsSync(filePath)) {
+    undoStack.push({ path: filePath, content: readFileSync(filePath, 'utf-8') })
+  } else {
+    undoStack.push({ path: filePath, content: null })
+  }
+  writeFileSync(filePath, content, 'utf-8')
+}
+
+function detectLanguage(filePath: string): string | null {
+  const ext = '.' + filePath.split('.').pop()!.toLowerCase()
+  for (const [lang, exts] of Object.entries(LANG_EXTENSIONS)) {
+    if ((exts as string[]).includes(ext)) return lang
+  }
+  return null
+}
+
 function suggestFilename(prompt: string, language: string): string {
   const slug = prompt
     .toLowerCase()
@@ -109,6 +131,15 @@ function resolvePath(p: string): string {
   return workingDir ? resolve(workingDir, p) : resolve(p)
 }
 
+function showCheckResult(result: CheckResult | null, label: string): void {
+  if (!result) return
+  const icon = result.success ? chalk.green(`✓ ${label} passed`) : chalk.red(`✗ ${label} errors`)
+  console.log(`${icon}  ${chalk.dim(`(${result.tool})`)}`)
+  if (!result.success && result.output) {
+    console.log(chalk.dim(result.output.split('\n').map((l: string) => '  ' + l).join('\n')))
+  }
+}
+
 // ── command handlers ───────────────────────────────────────────────────────
 async function cmdOpen(args: string[]): Promise<void> {
   const p = args[0]
@@ -129,6 +160,7 @@ async function cmdOpen(args: string[]): Promise<void> {
   }
 
   workingDir = resolved
+  setProjectConfigDir(workingDir)
   persistSession()
   console.log(chalk.green(`Working directory: ${workingDir}`))
 }
@@ -187,6 +219,7 @@ async function cmdSearch(args: string[]): Promise<void> {
   const { positional, opts } = parseArgs(args)
   const query = positional.join(' ')
   const language = opts.l ?? opts.language ?? defaultLanguage ?? undefined
+  const minStars = parseInt(opts['min-stars'] ?? '0', 10)
 
   if (!query) {
     console.log(chalk.red('Usage: search <query> [-l <language>]'))
@@ -201,7 +234,7 @@ async function cmdSearch(args: string[]): Promise<void> {
   const spinner = ora(`Searching GitHub for "${query}" (${language})...`).start()
   let repos
   try {
-    repos = await searchGitHub(query, language)
+    repos = await searchGitHub(query, language, 8, minStars)
     spinner.stop()
     process.stdin.resume()
   } catch (e: any) {
@@ -261,9 +294,11 @@ async function cmdGenerate(args: string[]): Promise<void> {
   const topK = parseInt(opts.k ?? opts['top-k'] ?? '8', 10)
   const outputFlag = opts.o ?? opts.output ?? undefined
   const fileFlag = opts.f ?? opts.file ?? undefined
+  const tempFlag = opts.temp ?? opts.temperature ?? undefined
+  const temperature = tempFlag !== undefined ? parseFloat(tempFlag) : undefined
 
   if (!prompt) {
-    console.log(chalk.red('Usage: gen "<prompt>" [-l <language>] [-f <file>] [-o <output>]'))
+    console.log(chalk.red('Usage: gen "<prompt>" [-l <language>] [-f <file>] [-o <output>] [--temp <n>]'))
     return
   }
   if (!language) {
@@ -276,18 +311,48 @@ async function cmdGenerate(args: string[]): Promise<void> {
   let fileContext: string | undefined
   if (fileFlag) {
     const filePath = resolvePath(fileFlag)
-    if (!existsSync(filePath)) {
+    if (filePath.includes('*')) {
+      // glob pattern
+      const globFiles = await fg(fileFlag, { cwd: workingDir ?? process.cwd(), absolute: true })
+      if (globFiles.length === 0) {
+        console.log(chalk.red(`No files matched: ${fileFlag}`))
+        return
+      }
+      fileContext = globFiles.map((f) => {
+        const name = relative(workingDir ?? process.cwd(), f)
+        return `// File: ${name}\n${readFileSync(f, 'utf-8')}`
+      }).join('\n\n')
+      console.log(chalk.dim(`Using context from ${globFiles.length} files`))
+    } else if (existsSync(filePath)) {
+      let stat: ReturnType<typeof statSync>
+      try { stat = statSync(filePath) } catch { stat = null as any }
+      if (stat && stat.isDirectory()) {
+        const exts = LANG_EXTENSIONS[language] ?? []
+        const patterns = exts.map((e) => `**/*${e}`)
+        const dirFiles = await fg(patterns, {
+          cwd: filePath,
+          ignore: ['**/node_modules/**', '**/.git/**', '**/.l-llm/**', '**/dist/**', '**/build/**'],
+          absolute: true,
+        })
+        fileContext = dirFiles.map((f) => {
+          const name = relative(filePath, f)
+          return `// File: ${name}\n${readFileSync(f, 'utf-8')}`
+        }).join('\n\n')
+        console.log(chalk.dim(`Using context from ${dirFiles.length} files in ${relative(workingDir ?? process.cwd(), filePath)}`))
+      } else {
+        fileContext = readFileSync(filePath, 'utf-8')
+        console.log(chalk.dim(`Using context from: ${relative(workingDir ?? process.cwd(), filePath)}`))
+      }
+    } else {
       console.log(chalk.red(`File not found: ${filePath}`))
       return
     }
-    fileContext = readFileSync(filePath, 'utf-8')
-    console.log(chalk.dim(`Using context from: ${relative(workingDir ?? process.cwd(), filePath)}`))
   }
 
   console.log(chalk.dim('\n--- Generated Code ---\n'))
   let output = ''
   try {
-    output = await generateCode(prompt, language, topK, fileContext)
+    output = await generateCode(prompt, language, topK, fileContext, temperature)
     console.log(chalk.dim('\n--- End ---\n'))
   } catch (e: any) {
     console.log(chalk.red(String(e.message ?? e)))
@@ -315,40 +380,51 @@ async function cmdGenerate(args: string[]): Promise<void> {
 
   if (savePath) {
     // Strip markdown code fences if present
-    const cleaned = output
+    let cleaned = output
       .replace(/^```[^\n]*\n/, '')
       .replace(/\n```\s*$/, '')
       .trimEnd()
 
     mkdirSync(resolve(savePath, '..'), { recursive: true })
-    writeFileSync(savePath, cleaned + '\n', 'utf-8')
+    writeWithUndo(savePath, cleaned + '\n')
 
     const display = workingDir ? relative(workingDir, savePath) : savePath
     console.log(chalk.green(`✓ Written to ${display}`))
 
     const checkCwd = workingDir ?? resolve(savePath, '..')
 
-    // Lint
-    const lintResult = lintFile(savePath, language, checkCwd)
-    if (lintResult) {
-      const label = lintResult.success ? chalk.green('✓ Lint passed') : chalk.red('✗ Lint errors')
-      console.log(`${label}  ${chalk.dim(`(${lintResult.tool})`)}`)
-      if (!lintResult.success && lintResult.output) {
-        console.log(chalk.dim(lintResult.output.split('\n').map(l => '  ' + l).join('\n')))
+    // Lint and build with auto-fix loop (up to 3 attempts)
+    let lintResult = lintFile(savePath, language, checkCwd)
+    let buildResult = buildCheck(savePath, language, checkCwd)
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const lintFailed = lintResult && !lintResult.success
+      const buildFailed = buildResult && !buildResult.success
+      if (!lintFailed && !buildFailed) break
+
+      const errors = [
+        lintFailed ? lintResult!.output : '',
+        buildFailed ? buildResult!.output : '',
+      ].filter(Boolean).join('\n')
+
+      console.log(chalk.yellow(`Auto-fix attempt ${attempt + 1}/3...`))
+      let fixed = ''
+      try {
+        fixed = await fixCode(cleaned, language, errors)
+      } catch {
+        break
       }
+      fixed = fixed.replace(/^```[^\n]*\n/, '').replace(/\n```\s*$/, '').trimEnd()
+      writeWithUndo(savePath, fixed + '\n')
+      cleaned = fixed
+      lintResult = lintFile(savePath, language, checkCwd)
+      buildResult = buildCheck(savePath, language, checkCwd)
     }
 
-    // Build / syntax check
-    const buildResult = buildCheck(savePath, language, checkCwd)
-    if (buildResult) {
-      const label = buildResult.success ? chalk.green('✓ Build passed') : chalk.red('✗ Build errors')
-      console.log(`${label}  ${chalk.dim(`(${buildResult.tool})`)}`)
-      if (!buildResult.success && buildResult.output) {
-        console.log(chalk.dim(buildResult.output.split('\n').map(l => '  ' + l).join('\n')))
-      }
-    }
+    showCheckResult(lintResult, 'Lint')
+    showCheckResult(buildResult, 'Build')
 
-    // Generate test file
+    // Generate test file, then run it
     const testFile = testFilename(savePath, language)
     const testPath = join(resolve(savePath, '..'), testFile)
     console.log(chalk.dim(`\n--- ${testFile} ---\n`))
@@ -360,11 +436,15 @@ async function cmdGenerate(args: string[]): Promise<void> {
         .replace(/^```[^\n]*\n/, '')
         .replace(/\n```\s*$/, '')
         .trimEnd()
-      writeFileSync(testPath, testCleaned + '\n', 'utf-8')
+      writeWithUndo(testPath, testCleaned + '\n')
       const testDisplay = workingDir ? relative(workingDir, testPath) : testPath
       console.log(chalk.green(`✓ Tests written to ${testDisplay}`))
     } catch (e: any) {
-      console.log(chalk.red(`Tests failed: ${String(e.message ?? e)}`))
+      console.log(chalk.red(`Test generation failed: ${String(e.message ?? e)}`))
+    }
+
+    if (existsSync(testPath)) {
+      showCheckResult(runTests(testPath, language, checkCwd), 'Tests')
     }
 
     // Offer to generate a dependency file if the language has one
@@ -393,10 +473,240 @@ async function cmdGenerate(args: string[]): Promise<void> {
           .replace(/^```[^\n]*\n/, '')
           .replace(/\n```\s*$/, '')
           .trimEnd()
-        writeFileSync(depPath, depCleaned + '\n', 'utf-8')
+        writeWithUndo(depPath, depCleaned + '\n')
         console.log(chalk.green(`✓ Written to ${depFileName}`))
       }
     }
+
+    lastCode = cleaned
+    lastSavePath = savePath
+    lastLanguage = language
+  }
+}
+
+async function cmdRefine(args: string[]): Promise<void> {
+  const instruction = args.join(' ').trim()
+  if (!instruction) {
+    console.log(chalk.red('Usage: refine "<instruction>"'))
+    return
+  }
+  if (!lastCode || !lastSavePath || !lastLanguage) {
+    console.log(chalk.red('No generated code in session. Run gen first.'))
+    return
+  }
+
+  console.log(chalk.dim('\n--- Refined Code ---\n'))
+  let output = ''
+  try {
+    output = await refineCode(lastCode, lastLanguage, instruction)
+    console.log(chalk.dim('\n--- End ---\n'))
+  } catch (e: any) {
+    console.log(chalk.red(String(e.message ?? e)))
+    return
+  }
+
+  const cleaned = output.replace(/^```[^\n]*\n/, '').replace(/\n```\s*$/, '').trimEnd()
+  writeWithUndo(lastSavePath, cleaned + '\n')
+
+  const checkCwd = workingDir ?? resolve(lastSavePath, '..')
+  showCheckResult(lintFile(lastSavePath, lastLanguage, checkCwd), 'Lint')
+  showCheckResult(buildCheck(lastSavePath, lastLanguage, checkCwd), 'Build')
+
+  lastCode = cleaned
+  const display = workingDir ? relative(workingDir, lastSavePath) : lastSavePath
+  console.log(chalk.green(`✓ Written to ${display}`))
+}
+
+async function cmdExplain(args: string[]): Promise<void> {
+  const filePath = args[0]
+  if (!filePath) {
+    console.log(chalk.red('Usage: explain <file>'))
+    return
+  }
+
+  const resolved = resolvePath(filePath)
+  if (!existsSync(resolved)) {
+    console.log(chalk.red(`File not found: ${resolved}`))
+    return
+  }
+
+  const language = detectLanguage(resolved)
+  if (!language) {
+    console.log(chalk.red(`Cannot detect language for: ${basename(resolved)}`))
+    return
+  }
+
+  const code = readFileSync(resolved, 'utf-8')
+  console.log(chalk.dim('\n--- Explanation ---\n'))
+  try {
+    await explainCode(code, language, basename(resolved))
+    console.log(chalk.dim('\n--- End ---\n'))
+  } catch (e: any) {
+    console.log(chalk.red(String(e.message ?? e)))
+  }
+}
+
+async function cmdFix(args: string[]): Promise<void> {
+  const filePath = args[0]
+  if (!filePath) {
+    console.log(chalk.red('Usage: fix <file>'))
+    return
+  }
+
+  const resolved = resolvePath(filePath)
+  if (!existsSync(resolved)) {
+    console.log(chalk.red(`File not found: ${resolved}`))
+    return
+  }
+
+  const language = detectLanguage(resolved)
+  if (!language) {
+    console.log(chalk.red(`Cannot detect language for: ${basename(resolved)}`))
+    return
+  }
+
+  const checkCwd = workingDir ?? resolve(resolved, '..')
+  const lintResult = lintFile(resolved, language, checkCwd)
+  const buildResult = buildCheck(resolved, language, checkCwd)
+
+  const lintFailed = lintResult && !lintResult.success
+  const buildFailed = buildResult && !buildResult.success
+
+  if (!lintFailed && !buildFailed) {
+    showCheckResult(lintResult, 'Lint')
+    showCheckResult(buildResult, 'Build')
+    console.log(chalk.green('No errors found.'))
+    return
+  }
+
+  const errors = [
+    lintFailed ? lintResult!.output : '',
+    buildFailed ? buildResult!.output : '',
+  ].filter(Boolean).join('\n')
+
+  const code = readFileSync(resolved, 'utf-8')
+  console.log(chalk.dim('\n--- Fixed Code ---\n'))
+  let output = ''
+  try {
+    output = await fixCode(code, language, errors)
+    console.log(chalk.dim('\n--- End ---\n'))
+  } catch (e: any) {
+    console.log(chalk.red(String(e.message ?? e)))
+    return
+  }
+
+  const cleaned = output.replace(/^```[^\n]*\n/, '').replace(/\n```\s*$/, '').trimEnd()
+  writeWithUndo(resolved, cleaned + '\n')
+
+  const display = workingDir ? relative(workingDir, resolved) : resolved
+  console.log(chalk.green(`✓ Written to ${display}`))
+
+  lastCode = cleaned
+  lastSavePath = resolved
+  lastLanguage = language
+}
+
+async function cmdRefactor(args: string[]): Promise<void> {
+  const filePath = args[0]
+  const instruction = args.slice(1).join(' ').trim()
+
+  if (!filePath || !instruction) {
+    console.log(chalk.red('Usage: refactor <file> "<instruction>"'))
+    return
+  }
+
+  const resolved = resolvePath(filePath)
+  if (!existsSync(resolved)) {
+    console.log(chalk.red(`File not found: ${resolved}`))
+    return
+  }
+
+  const language = detectLanguage(resolved)
+  if (!language) {
+    console.log(chalk.red(`Cannot detect language for: ${basename(resolved)}`))
+    return
+  }
+
+  const code = readFileSync(resolved, 'utf-8')
+  console.log(chalk.dim('\n--- Refactored Code ---\n'))
+  let output = ''
+  try {
+    output = await refactorCode(code, language, instruction)
+    console.log(chalk.dim('\n--- End ---\n'))
+  } catch (e: any) {
+    console.log(chalk.red(String(e.message ?? e)))
+    return
+  }
+
+  const cleaned = output.replace(/^```[^\n]*\n/, '').replace(/\n```\s*$/, '').trimEnd()
+  writeWithUndo(resolved, cleaned + '\n')
+
+  const display = workingDir ? relative(workingDir, resolved) : resolved
+  console.log(chalk.green(`✓ Written to ${display}`))
+
+  lastCode = cleaned
+  lastSavePath = resolved
+  lastLanguage = language
+}
+
+async function cmdEdit(args: string[]): Promise<void> {
+  const target = args[0] ? resolvePath(args[0]) : lastSavePath
+  if (!target) {
+    console.log(chalk.red('No file to edit. Provide a path or run gen first.'))
+    return
+  }
+  if (!existsSync(target)) {
+    console.log(chalk.red(`File not found: ${target}`))
+    return
+  }
+
+  const editor = process.env.VISUAL ?? process.env.EDITOR ?? (process.platform === 'win32' ? 'notepad' : 'vi')
+  iface.pause()
+  spawnSync(editor, [target], { stdio: 'inherit', shell: process.platform === 'win32' })
+  iface.resume()
+}
+
+function cmdUndo(): void {
+  const entry = undoStack.pop()
+  if (!entry) {
+    console.log(chalk.yellow('Nothing to undo.'))
+    return
+  }
+  if (entry.content === null) {
+    if (existsSync(entry.path)) {
+      unlinkSync(entry.path)
+      console.log(chalk.green(`✓ Deleted ${basename(entry.path)}`))
+    }
+  } else {
+    writeFileSync(entry.path, entry.content, 'utf-8')
+    console.log(chalk.green(`✓ Restored ${basename(entry.path)}`))
+  }
+}
+
+async function cmdIndex(args: string[]): Promise<void> {
+  const { positional } = parseArgs(args)
+  const dir = positional[0] ? resolvePath(positional[0]) : workingDir
+  const language = defaultLanguage
+
+  if (!dir) {
+    console.log(chalk.red('No path given and no working directory set.'))
+    return
+  }
+  if (!language) {
+    console.log(chalk.red('Specify a language: set language <lang>'))
+    return
+  }
+  if (!existsSync(dir)) {
+    console.log(chalk.red(`Path not found: ${dir}`))
+    return
+  }
+
+  const spinner = ora('Indexing...').start()
+  try {
+    const total = await ingestDir(dir, language, (msg) => { spinner.text = msg })
+    spinner.succeed(chalk.green(`Done — ${total} chunks indexed from ${dir}`))
+  } catch (e: any) {
+    spinner.fail(chalk.red(String(e.message ?? e)))
   }
 }
 
@@ -478,19 +788,35 @@ async function cmdClearCache(): Promise<void> {
 
 function cmdConfig(args: string[]): void {
   const { opts } = parseArgs(args)
-  if (opts.model) saveConfig({ llmModel: opts.model })
-  if (opts['embed-model']) saveConfig({ embedModel: opts['embed-model'] })
+
+  if (opts['github-token']) saveConfig({ githubToken: opts['github-token'] })
+
+  if (opts.project && workingDir) {
+    const projectUpdates: Parameters<typeof saveProjectConfig>[1] = {}
+    if (opts.model) projectUpdates.llmModel = opts.model
+    if (opts['embed-model']) projectUpdates.embedModel = opts['embed-model']
+    saveProjectConfig(workingDir, projectUpdates)
+    console.log(chalk.green(`✓ Project config saved to ${join(workingDir, '.l-llm', 'config.json')}`))
+  } else {
+    if (opts.model) saveConfig({ llmModel: opts.model })
+    if (opts['embed-model']) saveConfig({ embedModel: opts['embed-model'] })
+  }
 
   const config = getConfig()
   console.log(chalk.bold('Current config:'))
   console.log(chalk.dim('  LLM model:   ') + chalk.cyan(config.llmModel))
   console.log(chalk.dim('  Embed model: ') + chalk.cyan(config.embedModel))
   console.log(chalk.dim('  Index path:  ') + chalk.cyan(config.dbPath))
+  console.log(chalk.dim('  GitHub token:') + (config.githubToken ? chalk.cyan(' ****') : chalk.dim(' (not set)')))
   if (defaultLanguage) {
     console.log(chalk.dim('  Language:    ') + chalk.cyan(defaultLanguage) + chalk.dim('  (session)'))
   }
   if (workingDir) {
     console.log(chalk.dim('  Directory:   ') + chalk.cyan(workingDir) + chalk.dim('  (session)'))
+    const projectFile = join(workingDir, '.l-llm', 'config.json')
+    if (existsSync(projectFile)) {
+      console.log(chalk.dim('  Project cfg: ') + chalk.cyan(projectFile))
+    }
   }
 }
 
@@ -538,11 +864,12 @@ function cmdHelp(args: string[]): void {
       console.log('  Searches GitHub for repos matching your query and lets you pick ones to index.')
       console.log()
       console.log(chalk.bold('Usage:'))
-      console.log('  search <query> [-l <language>]')
+      console.log('  search <query> [-l <language>] [--min-stars <n>]')
       console.log()
       console.log(chalk.bold('Examples:'))
       console.log('  search http framework')
       console.log('  search async task queue -l python')
+      console.log('  search web framework --min-stars 1000')
     },
 
     generate: () => {
@@ -550,13 +877,14 @@ function cmdHelp(args: string[]): void {
       console.log('  Generates code using RAG context and optionally writes it to a file.')
       console.log()
       console.log(chalk.bold('Usage:'))
-      console.log('  gen "<prompt>" [-l <lang>] [-f <file>] [-o <output>] [-k <n>]')
+      console.log('  gen "<prompt>" [-l <lang>] [-f <file>] [-o <output>] [-k <n>] [--temp <n>]')
       console.log()
       console.log(chalk.bold('Options:'))
       console.log('  -l, --language <lang>   target language')
-      console.log('  -f, --file <path>       include a local file as extra context')
+      console.log('  -f, --file <path>       include a local file/dir/glob as extra context')
       console.log('  -o, --output <path>     write output directly to this file (skips prompt)')
       console.log('  -k, --top-k <n>         context chunks from index (default: 8)')
+      console.log('  --temp <n>              sampling temperature')
       console.log()
       console.log(chalk.bold('Examples:'))
       console.log('  gen "JWT auth middleware"')
@@ -593,7 +921,7 @@ function cmdHelp(args: string[]): void {
       console.log('  View or update model configuration.')
       console.log()
       console.log(chalk.bold('Usage:'))
-      console.log('  config [--model <name>] [--embed-model <name>]')
+      console.log('  config [--model <name>] [--embed-model <name>] [--github-token <token>] [--project]')
     },
 
     set: () => {
@@ -656,6 +984,13 @@ function cmdHelp(args: string[]): void {
   console.log(`  ${chalk.cyan('clear-cache')}                       Delete all cached repos in .l-llm`)
   console.log(`  ${chalk.cyan('config')} ${chalk.dim('[--model] [--embed-model]')}     View/change models`)
   console.log(`  ${chalk.cyan('set')} language <lang>               Set session language`)
+  console.log(`  ${chalk.cyan('refine')} "<instruction>"            Refine last generated code`)
+  console.log(`  ${chalk.cyan('explain')} <file>                    Explain what a file does`)
+  console.log(`  ${chalk.cyan('fix')} <file>                        Fix lint/build errors in a file`)
+  console.log(`  ${chalk.cyan('refactor')} <file> "<instruction>"   Refactor a file`)
+  console.log(`  ${chalk.cyan('edit')} [file]                       Open file in $EDITOR`)
+  console.log(`  ${chalk.cyan('undo')}                              Undo last file write`)
+  console.log(`  ${chalk.cyan('index')} [path]                      Index local directory`)
   console.log(`  ${chalk.cyan('help')} [topic]                      Show help`)
   console.log(`  ${chalk.cyan('exit')}                              Quit`)
   console.log()
@@ -681,6 +1016,13 @@ async function dispatch(args: string[]): Promise<boolean> {
     case 'clear-cache': await cmdClearCache(); break
     case 'config':      cmdConfig(rest); break
     case 'set':      cmdSet(rest); break
+    case 'refine':   await cmdRefine(rest); break
+    case 'explain':  await cmdExplain(rest); break
+    case 'fix':      await cmdFix(rest); break
+    case 'refactor': await cmdRefactor(rest); break
+    case 'edit':     await cmdEdit(rest); break
+    case 'undo':     cmdUndo(); break
+    case 'index':    await cmdIndex(rest); break
     case 'help':     cmdHelp(rest); break
     case 'exit':
     case 'quit':
@@ -734,6 +1076,7 @@ async function promptWorkingDir(): Promise<void> {
   }
 
   workingDir = resolved
+  setProjectConfigDir(workingDir)
   persistSession()
   console.log(chalk.green(`✓ Directory: ${workingDir}`))
 }
@@ -746,7 +1089,19 @@ async function main(): Promise<void> {
   console.log(chalk.bold('lang-llm') + chalk.dim('  local RAG code generation via Ollama'))
   console.log()
 
-  iface = createInterface({ input: process.stdin, output: process.stdout })
+  // Load history
+  const historyFile = join(CONFIG_DIR, 'history')
+  let history: string[] = []
+  if (existsSync(historyFile)) {
+    try {
+      const lines = readFileSync(historyFile, 'utf-8').split('\n').filter(Boolean)
+      history = lines.reverse()
+    } catch {
+      // ignore
+    }
+  }
+
+  iface = createInterface({ input: process.stdin, output: process.stdout, history })
 
   let sigintPending = false
   iface.on('SIGINT', () => {
@@ -775,6 +1130,7 @@ async function main(): Promise<void> {
     if (resume.trim().toLowerCase() !== 'n') {
       if (saved.workingDir && existsSync(saved.workingDir)) {
         workingDir = saved.workingDir
+        setProjectConfigDir(workingDir)
         console.log(chalk.green(`✓ Directory: ${workingDir}`))
       } else if (saved.workingDir) {
         console.log(chalk.yellow(`Saved directory not found: ${saved.workingDir}`))
@@ -817,6 +1173,16 @@ async function main(): Promise<void> {
   }
 
   iface.close()
+
+  // Save history
+  try {
+    mkdirSync(CONFIG_DIR, { recursive: true })
+    const hist = ((iface as any).history ?? []).slice(0, 500).reverse().join('\n')
+    writeFileSync(historyFile, hist, 'utf-8')
+  } catch {
+    // ignore
+  }
+
   console.log('\nGoodbye!')
 }
 

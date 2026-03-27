@@ -1,3 +1,5 @@
+import { getConfig } from './config.js'
+
 export interface GitHubRepo {
   full_name: string
   html_url: string
@@ -11,16 +13,23 @@ export async function searchGitHub(
   query: string,
   language: string,
   limit = 8,
+  minStars = 0,
 ): Promise<GitHubRepo[]> {
-  const q = encodeURIComponent(`${query} language:${language}`)
-  const url = `https://api.github.com/search/repositories?q=${q}&sort=stars&order=desc&per_page=${limit}`
+  const config = getConfig()
+  let q = `${query} language:${language}`
+  if (minStars > 0) q += ` stars:>=${minStars}`
+  const encoded = encodeURIComponent(q)
+  const url = `https://api.github.com/search/repositories?q=${encoded}&sort=stars&order=desc&per_page=${limit}`
 
-  const res = await fetch(url, {
-    headers: {
-      'User-Agent': 'lang-llm',
-      'Accept': 'application/vnd.github.v3+json',
-    },
-  })
+  const headers: Record<string, string> = {
+    'User-Agent': 'lang-llm',
+    'Accept': 'application/vnd.github.v3+json',
+  }
+  if (config.githubToken) {
+    headers['Authorization'] = `Bearer ${config.githubToken}`
+  }
+
+  const res = await fetch(url, { headers })
 
   if (!res.ok) {
     throw new Error(`GitHub API error: ${res.status} ${res.statusText}`)

@@ -36,8 +36,16 @@ export async function addChunks(
   }
 }
 
-export async function search(vector: number[], k = 8): Promise<ChunkMeta[]> {
+export async function search(vector: number[], k = 8, language?: string): Promise<ChunkMeta[]> {
   const index = getIndex()
+  if (language) {
+    const fetchK = Math.min(k * 10, 200)
+    const results = await index.queryItems(vector, fetchK)
+    const filtered = results
+      .map((r) => r.item.metadata as unknown as ChunkMeta)
+      .filter((m) => m.language === language)
+    return filtered.slice(0, k)
+  }
   const results = await index.queryItems(vector, k)
   return results.map((r) => r.item.metadata as unknown as ChunkMeta)
 }

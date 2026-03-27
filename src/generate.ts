@@ -25,6 +25,7 @@ export async function generateCode(
   language: string,
   topK = 8,
   fileContext?: string,   // content of local files to include as extra context
+  temperature?: number,
 ): Promise<string> {
   const config = getConfig()
   const ollama = new Ollama()
@@ -36,7 +37,7 @@ export async function generateCode(
   })
 
   // Retrieve most relevant code chunks from the index
-  const chunks = await search(embedding, topK)
+  const chunks = await search(embedding, topK, language)
 
   if (chunks.length === 0 && !fileContext) {
     throw new Error(`No indexed code found. Run: add <repo-url> -l ${language}`)
@@ -65,6 +66,7 @@ Write idiomatic ${language} code to accomplish the task above. Include concise i
     model: config.llmModel,
     prompt: fullPrompt,
     stream: true,
+    options: temperature !== undefined ? { temperature } : undefined,
   })
 
   let output = ''
@@ -115,6 +117,116 @@ export async function generateDepsFile(
 
   const prompt = `You are an expert ${language} developer. Analyze the following ${language} code and generate a minimal, valid ${depFileName} that declares only the external dependencies actually used. Output only the file content, no explanation or markdown fences.
 
+\`\`\`${language}
+${code}
+\`\`\``
+
+  const stream = await ollama.generate({
+    model: config.llmModel,
+    prompt,
+    stream: true,
+  })
+
+  let output = ''
+  for await (const chunk of stream) {
+    process.stdout.write(chunk.response)
+    output += chunk.response
+  }
+
+  return output
+}
+
+export async function fixCode(code: string, language: string, errors: string): Promise<string> {
+  const config = getConfig()
+  const ollama = new Ollama()
+
+  const prompt = `You are an expert ${language} developer. Fix the errors in the following ${language} code. Return only the corrected code with comments explaining the fixes. No prose outside of comments.
+
+Errors:
+${errors}
+
+Code:
+\`\`\`${language}
+${code}
+\`\`\``
+
+  const stream = await ollama.generate({
+    model: config.llmModel,
+    prompt,
+    stream: true,
+  })
+
+  let output = ''
+  for await (const chunk of stream) {
+    process.stdout.write(chunk.response)
+    output += chunk.response
+  }
+
+  return output
+}
+
+export async function refineCode(code: string, language: string, instruction: string): Promise<string> {
+  const config = getConfig()
+  const ollama = new Ollama()
+
+  const prompt = `You are an expert ${language} developer. Refine the following ${language} code according to the instruction. Keep existing comments. Output only the code.
+
+Instruction: ${instruction}
+
+Code:
+\`\`\`${language}
+${code}
+\`\`\``
+
+  const stream = await ollama.generate({
+    model: config.llmModel,
+    prompt,
+    stream: true,
+  })
+
+  let output = ''
+  for await (const chunk of stream) {
+    process.stdout.write(chunk.response)
+    output += chunk.response
+  }
+
+  return output
+}
+
+export async function explainCode(code: string, language: string, fileName: string): Promise<string> {
+  const config = getConfig()
+  const ollama = new Ollama()
+
+  const prompt = `You are an expert ${language} developer. Explain clearly what the following ${language} code from "${fileName}" does: its purpose, inputs/outputs, and any notable patterns. Prose output.
+
+\`\`\`${language}
+${code}
+\`\`\``
+
+  const stream = await ollama.generate({
+    model: config.llmModel,
+    prompt,
+    stream: true,
+  })
+
+  let output = ''
+  for await (const chunk of stream) {
+    process.stdout.write(chunk.response)
+    output += chunk.response
+  }
+
+  return output
+}
+
+export async function refactorCode(code: string, language: string, instruction: string): Promise<string> {
+  const config = getConfig()
+  const ollama = new Ollama()
+
+  const prompt = `You are an expert ${language} developer. Refactor the following ${language} code following the instruction. Preserve behaviour. Add or update comments as needed. Output only the code.
+
+Instruction: ${instruction}
+
+Code:
 \`\`\`${language}
 ${code}
 \`\`\``

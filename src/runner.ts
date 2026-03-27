@@ -119,3 +119,36 @@ export function testFilename(sourceFile: string, language: string): string {
   }
   return map[language] ?? `${name}.test.txt`
 }
+
+export function runTests(testFile: string, language: string, cwd: string): CheckResult | null {
+  switch (language) {
+    case 'typescript':
+    case 'javascript':
+      return run('npx', ['jest', '--no-coverage', testFile], cwd)
+          ?? run('npx', ['vitest', 'run', testFile], cwd)
+          ?? run('node', ['--test', testFile], cwd)
+    case 'python':
+      return run('pytest', [testFile, '-v'], cwd)
+          ?? run('python', ['-m', 'pytest', testFile, '-v'], cwd)
+          ?? run('python3', ['-m', 'pytest', testFile, '-v'], cwd)
+    case 'rust':
+      return run('cargo', ['test', '--quiet'], cwd)
+    case 'go':
+      return run('go', ['test', testFile], cwd)
+    case 'java':
+      return run('mvn', ['test', '-q'], cwd)
+          ?? run('gradle', ['test', '-q'], cwd)
+    case 'ruby':
+      return run('rspec', [testFile], cwd)
+          ?? run('ruby', [testFile], cwd)
+    case 'elixir':
+      return run('mix', ['test', testFile], cwd)
+    case 'kotlin':
+    case 'scala':
+      return run('gradle', ['test', '-q'], cwd)
+    case 'swift':
+      return run('swift', ['test'], cwd)
+    default:
+      return null
+  }
+}

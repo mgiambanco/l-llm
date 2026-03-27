@@ -10,7 +10,8 @@
       "Bash(node dist/cli.js help)",
       "Bash(node dist/cli.js help generate)",
       "Bash(node dist/cli.js help languages)",
-      "Bash(node dist/cli.js help models)"
+      "Bash(node dist/cli.js help models)",
+      "Bash(npx tsc:*)"
     ]
   }
 }
